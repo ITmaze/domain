@@ -1,0 +1,482 @@
+#!/bin/bash -u
+
+# test if we've launched using a -x flag
+if [[ "$-" == *x* ]]
+then
+	export readonly DEBUG=1
+else
+	export readonly DEBUG=0
+fi
+
+# set standard time for this command
+now=$(date --rfc-3339=s | cut -d+ -f1 | sed 's| |_|g' | tr -dc '[:digit:]')
+
+# a self-reference inside a zone record gets replaced with this "unique" string
+this_zone_marker="this_aws_zone_id"
+
+# fatal uses SIGUSR1 to allow clean fatal errors
+trap "exit 1" SIGUSR1
+PROC=$$
+
+fatal() {
+# stop execution
+	stty echo
+	if [ $# -eq 0 ]
+	then
+		fatal "A fatal error occurred while executing ${FUNCNAME[1]}, aborting."
+	fi
+	echo "$@" >> /dev/stderr
+	kill -SIGUSR1 -$PROC
+}
+
+alert() {
+# show an alert message
+	echo "$@" >> /dev/stderr
+}
+
+progress() {
+# show progress labels
+	if [ $# -eq 0 ]
+	then
+		echo ". done." >> /dev/stderr
+	else
+		echo -n "$@" >> /dev/stderr
+	fi
+}
+
+help() {
+# show help text
+	cat <<'	EOF' | sed 's|^\t\t||g'
+		This tool manages several AWS Route53 commands at a domain 
+		level. For authentication use AWS_PROFILE=profileName.
+
+		Usage: domain cmd [parameters]
+
+			account-create email [account name]
+				Create a sub-account with email address and
+				optional name.
+
+			domain-dig domain-name
+				Return the name servers for domain-name as
+				listed on the DNS.
+
+			domain-list
+				List all the domains in this account.
+
+			domain-dns domain-name
+				Display the name servers as configured in this
+				account.
+
+			domain-set domain-name
+				Set the name servers for domain-name to the
+				servers configured in the Route 53 record in
+				this account.
+
+			domain-whois domain-name
+				Display the whois information for domain-name.
+
+			zone-compare domain-name
+				Compare the Route53 domain servers with the DNS.
+
+			zone-create [filename]
+				Create a zone record. Use optional filename as
+				the source or pipe via stdin.
+
+			zone-delete domain-name
+				Delete the zone record for domain-name.
+
+			zone-list [domain-name]
+				Return a list of zone-ids and domain names in
+				this account. If a domain-name is specified, 
+				this returns the zone-id of that domain.
+
+			zone-show domain-name
+				Display the zone record for domain-name.
+
+			help
+				 This command. Display list of commands.
+
+	EOF
+}
+
+jq_update_domain_nameservers() {
+# jq filter to convert the name servers from a resource record into a Name=server list
+	cat <<-EOF
+		[
+			.ResourceRecordSets[]
+				|select(.Type=="NS") 
+				|.ResourceRecords[]
+				|"Name=\(.Value)"
+		]
+		|join(" ")
+	EOF
+}
+
+jq_create_record() {
+# jq filter to convert a resource record into a create record
+	cat <<-EOF
+		.ResourceRecordSets 
+			|{"Changes":[.[] 
+			|select(.Type!="SOA") 
+			|select(.Type!="NS") 
+			|{"Action":"CREATE","ResourceRecordSet":.}]}
+	EOF
+}
+
+jq_delete_record() {
+# jq filter to convert a resource record into a delete record
+	cat <<-EOF
+		.ResourceRecordSets 
+			|{"Changes":[.[] 
+			|select(.Type!="SOA") 
+			|select(.Type!="NS") 
+			|{"Action":"DELETE","ResourceRecordSet":.}]}
+	EOF
+}
+
+jq_get_domain_name() {
+#jq filter to return a domain name from a resource record
+	cat <<-EOF
+		.ResourceRecordSets[]
+		|select(.Type=="NS")
+		|.Name
+	EOF
+}
+
+jq_get_name_servers() {
+# jq filter to return the name servers from a resource record
+	cat <<-EOF
+		.ResourceRecordSets[]
+		|select(.Type=="NS")
+		|.ResourceRecords|map(.Value)[]
+	EOF
+}
+
+jq_get_change_id() {
+# jq filter to extract the change record id
+	cat <<-EOF
+		.ChangeInfo.Id
+	EOF
+}
+
+jq_get_domain_names() {
+# jq filter to show the domain names in this account
+	cat <<-EOF
+		.Domains[]
+	EOF
+}
+
+jq_get_domain_name() {
+# jq filter to return the name from the SOA record
+	cat <<-EOF
+		.ResourceRecordSets[]
+		|select(.Type=="SOA")
+		|.Name
+	EOF
+}
+
+string_contains() {
+	[ -z "$1" ] || {
+		[ -z "${2##*$1*}" ] && [ -n "$2" ]
+	}
+}
+
+aws() {
+	echo "aws $@" >> ".${now}.aws.log"
+	command aws "$@"
+	stty echo
+}
+
+check_id() {
+# check if a zone id parameter was supplied
+	if [ $# -ne 2 ]
+	then
+		fatal "Error: no ${1}_id specified for ${FUNCNAME[1]}."
+	fi
+	echo "$2"
+}
+
+fqdn() {
+# return a domain name with a '.' at the end, bail if no domain supplied
+	if [ $# -eq 1 ] && [ ! -z "$1" ]
+	then
+		echo "$1" | sed 's|\.$||g;s|$|.|g'
+	else
+		fatal "Error: no domain specified for ${cmd}."
+	fi
+}
+
+wait_for_resource_record_sets_changed() {
+# wait until the record change has been completed given a change_id
+	id=$(echo "$@" | jq -r "$(jq_get_change_id)")
+	change_id=$(check_id change "${id}")
+	((!DEBUG)) && (aws route53 wait resource-record-sets-changed --id "${change_id}" || fatal)
+	progress
+}
+
+list_resource_record_sets() {
+# get the zone record given a zone_id
+	zone_id=$(check_id zone "${1-}")
+	(aws route53 list-resource-record-sets --hosted-zone-id "${zone_id}" --output json || fatal)
+}
+
+change_resource_record_sets() {
+# update a zone record and return the change record
+	zone_id=$(check_id zone "${1-}")
+	shift
+	zone_record="$*"
+	if string_contains "CREATE" "${zone_record}" || string_contains "DELETE" "${zone_record}"
+	then
+		if ((DEBUG))
+		then
+			echo aws route53 change-resource-record-sets --hosted-zone-id "${zone_id}" --change-batch "${zone_record}"
+		else
+			if string_contains "CREATE" "${zone_record}"
+			then
+				progress "Creating record ."
+			else
+				progress "Deleting record ."
+			fi
+			change_rec=$(aws route53 change-resource-record-sets --hosted-zone-id "${zone_id}" --change-batch "${zone_record}" || fatal)
+			wait_for_resource_record_sets_changed "${change_rec}"
+		fi
+	else
+		alert "Warning: skipping empty record."
+	fi
+}
+
+delete_empty_zone() {
+# delete this zone
+	zone_id=$(check_id zone "${1-}")
+	if ((DEBUG))
+	then
+		echo aws route53 delete-hosted-zone --id="${zone_id}"
+	else
+		progress "Deleting zone ."
+		change_rec=$(aws route53 delete-hosted-zone --id="${zone_id}" || fatal)
+		wait_for_resource_record_sets_changed "${change_rec}"
+	fi
+}
+
+zone_list() {
+# return list of zone_id
+	if [ $# -eq 1 ]
+	then
+		domain_name=$(fqdn "$1")
+		query="HostedZones[?Name=='${domain_name}'].[Id]"
+	else
+		query="HostedZones[*].[Id,Name]"
+	fi
+	(aws route53 list-hosted-zones --query "${query}" --output text || fatal) | sed 's|^/hostedzone/||g'
+}
+
+check_single_zone() {
+# we should have only one zone record for a domain
+	domain_name="${1-unknown}"
+	zone_count=$(echo -n "${@:2}" | grep -c '^')
+	if [ "${zone_count}" -ne 1  ]
+	then
+		fatal "Error: the ${domain_name} domain has ${zone_count} configured records."
+	fi
+}
+
+zone_delete() {
+# empty the zone and delete it
+	domain_name=$(fqdn "${1-}")
+	zone_id=$(zone_list "${domain_name}")
+	check_single_zone "${domain_name}" "${zone_id}"
+	delete_this_zone=$(list_resource_record_sets "${zone_id}" | jq -r "$(jq_delete_record)")
+	change_resource_record_sets "${zone_id}" "${delete_this_zone}"
+	delete_empty_zone "${zone_id}"
+}
+
+domain_dig() {
+# return the name servers as listed on the DNS
+	domain_name=$(fqdn "${1-}")
+	dig +short NS @8.8.8.8 "${domain_name}" | sort
+}
+
+domain_dns() {
+# return the name servers as configured in this account
+	action="${1-}"
+	domain_name=$(fqdn "${2-}")
+	case "${action}" in
+		list)
+			filter="$(jq_get_name_servers)"
+			;;
+		update)
+			filter="$(jq_update_domain_nameservers)"
+			;;
+		*)
+			fatal "Error: unexpected script error '${action}' during ${FUNCNAME[0]}."
+			;;
+	esac
+	zone_id=$(zone_list "${domain_name}")
+	check_single_zone "${domain_name}" "${zone_id}"
+	(aws route53 list-resource-record-sets --hosted-zone-id "${zone_id}" --output json || fatal) | jq -r "${filter}" | sort
+}
+
+zone_compare() {
+# compare the DNS to the record in Route 53
+	domain_name=$(fqdn "${1-}")
+	current_servers=$(domain_dig "${domain_name}")
+	configured_servers=$(domain_dns list "${domain_name}")
+	if [ "${current_servers}" != "${configured_servers}" ]
+	then
+		echo "Warning: The Route 53 name servers for '$1' do not match the DNS."
+		paste <(echo "Configured" ; echo "${configured_servers}") <(echo "Current" ; echo "${current_servers}")
+	fi
+}
+
+domain_set() {
+# set the name servers for the domain to those in Route 53
+	domain_name=$(fqdn "${1-}")
+	name_servers=$(domain_dns update "${domain_name}")
+	if ((DEBUG))
+	then
+		echo aws route53domains update-domain-nameservers --region us-east-1 --domain-name "${domain_name}" --nameservers ${name_servers}
+	else
+		progress "Setting name servers ."
+		change_rec=$(aws route53domains update-domain-nameservers --region us-east-1 --domain-name "${domain_name}" --nameservers ${name_servers} || fatal)
+		progress
+	fi
+}
+
+account_create() {
+# create a sub-account
+	email="${1-}"
+	account="${2:-$email}"
+	if [ -z "${email}" ]
+	then
+		fatal "Error: no account email address specified for ${cmd}."
+	fi
+	if ((DEBUG))
+	then
+		echo aws organizations create-account --email "${email}" --account-name "${account}"
+	else
+		progress "Creating sub account ."
+		(aws organizations create-account --email "${email}" --account-name "${account}" || fatal)
+		progress
+	fi
+}
+
+domain_list() {
+# list the domains in this account
+	filter="$(jq_get_domain_names)"
+	(aws route53domains list-domains --region us-east-1 --output json || fatal) | jq -r "${filter}"
+}
+
+domain_whois() {
+# show the whois record for a domain in this account
+	domain_name=$(fqdn "${1-}")
+	(aws route53domains get-domain-detail --region us-east-1 --domain-name "${domain_name}" --output json || fatal)
+}
+
+zone_show() {
+# show the domain record stored in Route 53
+	domain_name=$(fqdn "${1-}")
+	zone_id=$(zone_list "${domain_name}")
+	check_single_zone "${domain_name}" "${zone_id}"
+	(aws route53 list-resource-record-sets --hosted-zone-id "${zone_id}" --output json || fatal) | sed "s|${zone_id}|${this_zone_marker}|g"
+}
+
+zone_create() {
+# create a zone record
+	if [ $# -eq 1 ] && [ -f "$1" ]
+	then
+		input="$1"
+	else
+		input=/dev/stdin
+	fi
+	zone_record=$(< <(cat "${input}"))
+	filter="$(jq_get_domain_name)"
+	domain_name=$(echo "${zone_record}" | jq -r "${filter}")
+	reference=$(uuidgen)
+	comment="${now}"
+	if ((DEBUG))
+	then
+		echo aws route53 create-hosted-zone --name "${domain_name}" --caller-reference "${reference}" --hosted-zone-config Comment="${comment}"
+		zone_id='dummy_zone_id'
+		change_rec='dummy_change_rec'
+	else
+		progress "Creating zone for '${domain_name}' with comment '${comment}' ."
+		change_rec=$(aws route53 create-hosted-zone --name "${domain_name}" --caller-reference "${reference}" --hosted-zone-config Comment="${comment}" || fatal)
+		
+		zone_id=$(echo "${change_rec}" | jq -r '.HostedZone.Id' | cut -d/ -f3)
+	fi
+	if [ -z "${zone_id}" ]
+	then
+		fatal "Zone creation failed for '${domain_name}'."
+	fi
+	wait_for_resource_record_sets_changed "${change_rec}"
+	filter="$(jq_create_record)"
+	new_zone_record=$(echo "${zone_record}" | jq -r "${filter}" | sed "s|${this_zone_marker}|${zone_id}|g")
+	change_resource_record_sets "${zone_id}" "${new_zone_record}"
+	((!DEBUG)) && (aws route53 list-hosted-zones-by-name --hosted-zone-id "${zone_id}" || fatal)
+}
+
+command_exists () {
+    type "$1" &> /dev/null ;
+}
+
+for test_cmd in 'aws' 'cat' 'cut' 'date' 'dig' 'grep' 'jq' 'paste' 'sed' 'tr' 'uuidgen'
+do
+	command_exists "${test_cmd}" || fatal "Error: This tool requires '${test_cmd}'."
+done
+
+cmd="${1-help}"
+shift
+
+case "${cmd}" in
+	account-create)
+		account_create "$@"
+		;;
+
+	domain-dig)
+		domain_dig "$@"
+		;;
+
+	domain-list)
+		domain_list "$@"
+		;;
+
+	domain-dns)
+		domain_dns list "$@"
+		;;
+
+	domain-set)
+		domain_set "$@"
+		;;
+
+	domain-whois)
+		domain_whois "$@"
+		;;
+
+	zone-compare)
+		zone_compare "$@"
+		;;
+
+	zone-create)
+		zone_create "$@"
+		;;
+
+	zone-delete)
+		zone_delete "$@"
+		;;
+
+	zone-list)
+		zone_list "$@"
+		;;
+
+	zone-show)
+		zone_show "$@"
+		;;
+
+	help)
+		help
+		;;
+
+	*)
+		fatal "Unknown command: '${cmd}', use help for more information."
+		;;
+esac
