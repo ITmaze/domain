@@ -61,7 +61,7 @@ In addition, I noticed that I was often needing to move zones to new-sub account
 * Delete the zone record for domain-name.
 
 *zone-list* [domain-name]
-* Return a list of zone-ids and domain names in this account. If a domain-name is specified, this returns the zone-id of that domain.
+* Return a list of zone-ids and domain names in this account. If a domain-name is specified, return the zone-id of that domain.
 
 *zone-show* domain-name
 * Display the zone record for domain-name.
@@ -103,6 +103,8 @@ If you want to see more detailed output, you can call the tool using the bash -x
 I use this tool. It works for me. It might not for you. It might kill a kitten when you use it. You've been warned.
 
 It is possible that this tool has assumptions built-in that I'm not aware of that cause you grief. If the tool fails for you, please provide a pull-request.
+
+This tool was written and tested against aws-cli/1.11.125 Python/2.7.3 Linux/3.2.0-4-amd64 botocore/1.5.88
 
 
 ## Author

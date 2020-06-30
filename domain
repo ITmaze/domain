@@ -88,7 +88,7 @@ help() {
 			zone-list [domain-name]
 				Return a list of zone-ids and domain names in
 				this account. If a domain-name is specified, 
-				this returns the zone-id of that domain.
+				return the zone-id of that domain.
 
 			zone-show domain-name
 				Display the zone record for domain-name.
