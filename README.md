@@ -7,6 +7,7 @@ The tool greatly simplifies complex operations such as deleting a zone and copyi
 For example, to delete a zone record in Route 53 requires the following calls to the AWS API:
 
 * aws route53 list-hosted-zones
+* aws route53 list-resource-record-sets
 * {convert the output of the above to add "DELETE" as an action}
 * aws route53 change-resource-record-sets
 * aws route53 wait resource-record-sets-changed
